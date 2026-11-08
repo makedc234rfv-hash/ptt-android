@@ -9,8 +9,8 @@ android {
         applicationId "com.marco.ptt"
         minSdk 26
         targetSdk 34
-        versionCode 3
-        versionName "0.3"
+        versionCode 4
+        versionName "0.4"
     }
     // 固定签名：每次编译出的 APK 签名一致，才能直接覆盖安装
     signingConfigs {
