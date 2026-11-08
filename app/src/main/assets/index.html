@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>对讲</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:14px;font:15px/1.5 -apple-system,system-ui,"PingFang SC","Microsoft YaHei",sans-serif;background:#111;color:#eee}
+h1{font-size:18px;margin:0 0 10px}
+.card{background:#1d1d1d;border:1px solid #333;border-radius:10px;padding:12px;margin-bottom:12px}
+input[type=text],textarea{width:100%;padding:8px;border-radius:6px;border:1px solid #444;background:#000;color:#eee;font:13px monospace}
+textarea{height:70px}
+button{padding:9px 14px;border:0;border-radius:6px;background:#2f6fed;color:#fff;font-size:15px;margin:6px 6px 0 0}
+button:disabled{background:#444}
+.row{display:flex;gap:8px;align-items:center}
+.k{color:#888;font-size:13px}
+.v{font-family:monospace;font-size:13px;word-break:break-all;white-space:pre-wrap}
+#state{font-weight:bold}
+.ok{color:#3ddc84}.bad{color:#ff5a5a}.mid{color:#f5c542}
+#ptt{display:block;width:100%;height:150px;margin:0;font-size:24px;border-radius:16px;background:#333;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+#ptt.on{background:#e53935}
+#rtalk{margin-top:8px;text-align:center;height:22px}
+#log{font:12px monospace;color:#aaa;white-space:pre-wrap;max-height:220px;overflow:auto}
+details summary{cursor:pointer;color:#8ab4ff}
+</style>
+</head>
+<body>
+<h1>对讲 <span class="k">音量下键=按住说话</span></h1>
+
+<div class="card">
+  <div class="row"><input type="text" id="room" placeholder="房间号（两台手机填一样的）"><button id="join">加入</button></div>
+  <label class="k"><input type="checkbox" id="v6only"> 仅 IPv6 直连（不用 STUN/中继）</label>
+</div>
+
+<div class="card">
+  <div>状态：<span id="state" class="mid">未连接</span></div>
+  <div class="k">本机地址</div><div class="v" id="myips">-</div>
+  <div class="k">实际通路</div><div class="v" id="path">-</div>
+  <div class="k">往返延迟</div><div class="v"><span id="rtt2">-</span> &nbsp; <span id="rtt">-</span></div>
+</div>
+
+<div class="card">
+  <button id="ptt">按住说话</button>
+  <div id="rtalk"></div>
+  <audio id="remote" autoplay playsinline></audio>
+</div>
+
+<details class="card">
+  <summary>手动模式（信令连不上时用：复制粘贴交换连接码）</summary>
+  <p class="k">A 点「生成邀请码」→ 发给 B → B 粘贴后点「使用对方的码」→ 把生成的应答码发回 A → A 粘贴并点「使用对方的码」。</p>
+  <button id="mkoffer">生成邀请码</button><button id="copy">复制我的码</button>
+  <textarea id="sdpOut" readonly placeholder="我的码"></textarea>
+  <textarea id="sdpIn" placeholder="粘贴对方的码"></textarea>
+  <button id="usecode">使用对方的码</button>
+</details>
+
+<div class="card"><div class="k">日志</div><div id="log"></div></div>
+
+<script src="mqtt.min.js"></script>
+<script>
+</script>
+<script>
+const $ = id => document.getElementById(id);
+const log = m => { const t = new Date().toTimeString().slice(0, 8); $('log').textContent = `[${t}] ${m}\n` + $('log').textContent; };
+const myId = Math.random().toString(36).slice(2, 8);
+let pc, dc, stream, client, peerId, topic, pingTimer;
+let pendingCands = [];
+const localIPs = new Set();
+
+const candAddr = c => (c || '').split(' ')[4];
+function allowCand(c) {
+  if (!c) return true;
+  const a = candAddr(c);
+  if (!a || a.endsWith('.local')) return false;
+  return $('v6only').checked ? a.includes(':') : true;
+}
+function setState(s) {
+  const el = $('state');
+  const map = { connected: ['已连接 ✅', 'ok'], completed: ['已连接 ✅', 'ok'], checking: ['正在打通…', 'mid'],
+    failed: ['失败 ❌（直连不通）', 'bad'], disconnected: ['断开', 'bad'], new: ['准备中', 'mid'], closed: ['已关闭', 'bad'] };
+  const [txt, cls] = map[s] || [s, 'mid'];
+  el.textContent = txt; el.className = cls;
+}
+
+async function getMic() {
+  if (stream) return;
+  if (!window.isSecureContext) { log('❌ 必须用 https 打开，否则拿不到麦克风'); throw new Error('insecure'); }
+  // 先拿麦克风权限，浏览器才会暴露真实 IP（否则只给 .local）
+  stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  stream.getAudioTracks().forEach(t => t.enabled = false);
+  log('麦克风已授权');
+}
+
+function newPC() {
+  const ice = $('v6only').checked ? [] : [{ urls: 'stun:stun.miwifi.com:3478' }, { urls: 'stun:stun.qq.com:3478' }, { urls: 'stun:stun.l.google.com:19302' }];
+  pc = new RTCPeerConnection({ iceServers: ice });
+  stream.getTracks().forEach(t => pc.addTrack(t, stream));
+  dc = pc.createDataChannel('ctl', { negotiated: true, id: 0 });
+  dc.onopen = () => {
+    log('数据通道已打开');
+    clearInterval(pingTimer);
+    pingTimer = setInterval(() => { if (dc.readyState === 'open') dc.send(JSON.stringify({ t: 'ping', ts: performance.now() })); }, 2000);
+  };
+  dc.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.t === 'ping') dc.send(JSON.stringify({ t: 'pong', ts: m.ts }));
+    if (m.t === 'pong') $('rtt').textContent = (performance.now() - m.ts).toFixed(0) + ' ms (数据通道)';
+    if (m.t === 'talk') $('rtalk').textContent = m.on ? '🔊 对方在说话' : '';
+  };
+  pc.ontrack = e => { const a = $('remote'); a.srcObject = e.streams[0]; a.play().catch(() => {}); log('收到对方音频'); };
+  pc.onicecandidate = e => {
+    if (!e.candidate) { log('本机地址收集完成'); return; }
+    const c = e.candidate.candidate, a = candAddr(c);
+    if (a && !a.endsWith('.local')) {
+      localIPs.add(`${a}  [${e.candidate.type}${a.includes(':') ? ', IPv6' : ', IPv4'}]`);
+      $('myips').textContent = [...localIPs].join('\n');
+    }
+    if (allowCand(c) && peerId && client) send({ type: 'cand', data: e.candidate.toJSON() });
+  };
+  pc.oniceconnectionstatechange = () => { setState(pc.iceConnectionState); log('ICE: ' + pc.iceConnectionState); };
+  setState('new');
+}
+
+// 实际走的通路 + ICE 往返
+setInterval(async () => {
+  if (!pc) return;
+  const s = await pc.getStats();
+  let pair;
+  s.forEach(r => { if (r.type === 'transport' && r.selectedCandidatePairId) pair = s.get(r.selectedCandidatePairId); });
+  if (!pair) s.forEach(r => { if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r; });
+  if (!pair) return;
+  const l = s.get(pair.localCandidateId), r = s.get(pair.remoteCandidateId);
+  if (l && r) $('path').textContent = `我 ${l.address || l.ip}:${l.port} (${l.candidateType})\n⇅\n对方 ${r.address || r.ip}:${r.port} (${r.candidateType})`;
+  if (pair.currentRoundTripTime != null) $('rtt2').textContent = (pair.currentRoundTripTime * 1000).toFixed(0) + ' ms (ICE)';
+}, 2000);
+
+// ---------- 自动模式：公共 MQTT 当信令 ----------
+function send(m) {
+  m.from = myId; if (peerId) m.to = peerId;
+  client.publish(topic, JSON.stringify(m));
+}
+async function join() {
+  const room = $('room').value.trim();
+  if (!room) { log('请先填房间号'); return; }
+  try { await getMic(); } catch (e) { log('麦克风失败: ' + e.message); return; }
+  if (typeof mqtt === 'undefined') { log('❌ MQTT 库加载失败，请用下方手动模式'); return; }
+  topic = 'ptt-v6test/' + room;
+  $('join').disabled = true; $('v6only').disabled = true;
+  client = mqtt.connect('wss://broker.emqx.io:8084/mqtt', { clientId: 'v6t_' + myId, clean: true, reconnectPeriod: 3000 });
+  client.on('connect', () => { log(`信令已连接，房间 ${room}，我的 ID ${myId}，等待对方…`); client.subscribe(topic, () => send({ type: 'hello' })); });
+  client.on('error', e => log('MQTT 错误: ' + e.message));
+  client.on('message', (t, buf) => {
+    let m; try { m = JSON.parse(buf.toString()); } catch { return; }
+    if (m.from === myId || (m.to && m.to !== myId)) return;
+    onSignal(m).catch(e => log('信令处理错误: ' + e.message));
+  });
+}
+async function onSignal(m) {
+  if (m.type === 'hello') {
+    if (peerId && peerId !== m.from) return;
+    const isNew = !peerId; peerId = m.from;
+    if (isNew) {
+      log('发现对方 ' + peerId);
+      send({ type: 'hello' });
+      if (myId < peerId) {
+        newPC();
+        await pc.setLocalDescription(await pc.createOffer());
+        send({ type: 'offer', data: pc.localDescription.toJSON() });
+        log('已发送 offer');
+      }
+    }
+  } else if (m.type === 'offer') {
+    if (!pc) newPC();
+    await pc.setRemoteDescription(m.data); flush();
+    await pc.setLocalDescription(await pc.createAnswer());
+    send({ type: 'answer', data: pc.localDescription.toJSON() });
+    log('已发送 answer');
+  } else if (m.type === 'answer') {
+    await pc.setRemoteDescription(m.data); flush();
+  } else if (m.type === 'cand') {
+    if (!allowCand(m.data.candidate)) return;
+    if (pc && pc.remoteDescription) pc.addIceCandidate(m.data).catch(e => log('候选地址错误 ' + e.message));
+    else pendingCands.push(m.data);
+  }
+}
+function flush() { pendingCands.forEach(c => pc.addIceCandidate(c).catch(() => {})); pendingCands = []; }
+
+// ---------- 手动模式 ----------
+const filterSDP = sdp => sdp.split('\r\n').filter(l => !l.startsWith('a=candidate:') || allowCand(l.slice(2))).join('\r\n');
+function waitGather() {
+  return new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    const f = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', f); res(); } };
+    pc.addEventListener('icegatheringstatechange', f);
+    setTimeout(res, 5000);
+  });
+}
+$('mkoffer').onclick = async () => {
+  try {
+    await getMic(); newPC();
+    await pc.setLocalDescription(await pc.createOffer()); await waitGather();
+    $('sdpOut').value = btoa(JSON.stringify({ type: 'offer', sdp: filterSDP(pc.localDescription.sdp) }));
+    log('邀请码已生成，复制发给对方');
+  } catch (e) { log('错误: ' + e.message); }
+};
+$('usecode').onclick = async () => {
+  try {
+    const d = JSON.parse(atob($('sdpIn').value.trim()));
+    if (d.type === 'offer') {
+      await getMic(); newPC();
+      await pc.setRemoteDescription(d);
+      await pc.setLocalDescription(await pc.createAnswer()); await waitGather();
+      $('sdpOut').value = btoa(JSON.stringify({ type: 'answer', sdp: filterSDP(pc.localDescription.sdp) }));
+      log('应答码已生成，复制发回给对方');
+    } else {
+      await pc.setRemoteDescription(d); log('已应用应答码，等待连接…');
+    }
+  } catch (e) { log('码无效或出错: ' + e.message); }
+};
+$('copy').onclick = () => {
+  const t = $('sdpOut'); t.select();
+  (navigator.clipboard ? navigator.clipboard.writeText(t.value) : Promise.reject()).then(() => log('已复制'), () => { document.execCommand('copy'); log('已复制'); });
+};
+
+// ---------- 按住说话 ----------
+const btn = $('ptt');
+function talk(on) {
+  if (!stream) return;
+  stream.getAudioTracks().forEach(t => t.enabled = on);
+  btn.classList.toggle('on', on);
+  btn.textContent = on ? '说话中…松开结束' : '按住说话';
+  $('remote').play().catch(() => {});
+  if (dc && dc.readyState === 'open') dc.send(JSON.stringify({ t: 'talk', on }));
+}
+btn.addEventListener('pointerdown', e => { e.preventDefault(); btn.setPointerCapture(e.pointerId); talk(true); });
+['pointerup', 'pointercancel', 'lostpointercapture'].forEach(ev => btn.addEventListener(ev, () => talk(false)));
+btn.addEventListener('contextmenu', e => e.preventDefault());
+
+$('join').onclick = join;
+try { const r = localStorage.getItem('room'); if (r) $('room').value = r; } catch (e) {}
+$('room').addEventListener('change', () => { try { localStorage.setItem('room', $('room').value.trim()); } catch (e) {} });
+log('就绪。两台手机填同一个房间号点加入。');
+</script>
+</body>
+</html>
