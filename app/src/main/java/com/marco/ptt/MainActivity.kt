@@ -6,7 +6,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.view.KeyEvent
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -53,19 +52,6 @@ class MainActivity : Activity() {
             // 前台服务：锁屏/切后台时保持进程和网络，继续收听
             startForegroundService(Intent(this, PttService::class.java))
         }
-    }
-
-    // 音量下键 = 按住说话
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-                web.evaluateJavascript("talk(true)", null)
-            } else if (event.action == KeyEvent.ACTION_UP) {
-                web.evaluateJavascript("talk(false)", null)
-            }
-            return true
-        }
-        return super.dispatchKeyEvent(event)
     }
 
     // 返回键不退出，只退到后台，保持在线
